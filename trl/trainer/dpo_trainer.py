@@ -121,7 +121,7 @@ class DPOTrainer(Trainer):
             The function to use to compute the metrics. Must take a `EvalPrediction` and return
             a dictionary string to metric values.
         precompute_ref_log_probs (`bool`, defaults to `False`):
-            Flag to precompute reference model log probabilities and evaluation datasets. This is useful if you want to train
+            Flag to precompute reference model log probabilities for training and evaluation datasets. This is useful if you want to train
             without the reference model and reduce the total GPU memory needed.
         dataset_num_proc (`Optional[int]`, *optional*):
             The number of workers to use to tokenize the data. Defaults to None.
@@ -133,6 +133,10 @@ class DPOTrainer(Trainer):
             Name of the train target PEFT adapter, when using LoRA with multiple adapters.
         ref_adapter_name (`str`, defaults to `None`):
             Name of the reference PEFT adapter, when using LoRA with multiple adapters.
+        reference_free (`bool`):
+            If True, we ignore the _provided_ reference model and implicitly use a reference model that assigns equal probability to all responses.
+        force_use_ref_model (`bool`, defaults to `False`):
+            In case one passes a PEFT model for the active model and you want to use a different model for the ref_model, set this flag to `True`.
     """
 
     _tag_names = ["trl", "dpo"]
@@ -170,6 +174,8 @@ class DPOTrainer(Trainer):
         ref_model_init_kwargs: Optional[Dict] = None,
         model_adapter_name: Optional[str] = None,
         ref_adapter_name: Optional[str] = None,
+        reference_free: bool = False,
+        force_use_ref_model: bool = False,
     ):
         if model_init_kwargs is None:
             model_init_kwargs = {}
@@ -210,10 +216,11 @@ class DPOTrainer(Trainer):
             if isinstance(model, PeftModel):
                 model = model.merge_and_unload()
 
-            if ref_model is not None:
+            if ref_model is not None and not force_use_ref_model:
                 raise ValueError(
                     "You passed both a ref_model and a peft_config. For training PEFT adapters with DPO there is no need to pass a reference"
-                    " model. Please pass `ref_model=None` in case you want to train PEFT adapters."
+                    " model. Please pass `ref_model=None` in case you want to train PEFT adapters, or pass a ref_model with `force_use_ref_model=True` in DPOTrainer's init."
+                    " if you want to use a different ref_model."
                 )
 
             if getattr(model, "is_loaded_in_8bit", False) or getattr(model, "is_loaded_in_4bit", False):
@@ -223,12 +230,12 @@ class DPOTrainer(Trainer):
                     inspect.signature(prepare_model_for_kbit_training).parameters
                 )
 
-                preprare_model_kwargs = {"use_gradient_checkpointing": args.gradient_checkpointing}
+                prepare_model_kwargs = {"use_gradient_checkpointing": args.gradient_checkpointing}
 
                 if _support_gc_kwargs:
-                    preprare_model_kwargs["gradient_checkpointing_kwargs"] = args.gradient_checkpointing_kwargs
+                    prepare_model_kwargs["gradient_checkpointing_kwargs"] = args.gradient_checkpointing_kwargs
 
-                model = prepare_model_for_kbit_training(model, **preprare_model_kwargs)
+                model = prepare_model_for_kbit_training(model, **prepare_model_kwargs)
             elif getattr(args, "gradient_checkpointing", False):
                 # For backward compatibility with older versions of transformers
                 if hasattr(model, "enable_input_require_grads"):
@@ -247,7 +254,7 @@ class DPOTrainer(Trainer):
                 # If args.bf16 we need to explicitly call `generate` with torch amp autocast context manager
                 self._peft_has_been_casted_to_bf16 = True
 
-        # For models that use gradient_checkpoiting, we need to attach a hook that enables input
+        # For models that use gradient_checkpointing, we need to attach a hook that enables input
         # to explicitly have `requires_grad=True`, otherwise training will either silently
         # fail or completely fail.
         elif getattr(args, "gradient_checkpointing", False):
@@ -277,6 +284,7 @@ class DPOTrainer(Trainer):
         self.is_peft_model = is_peft_available() and isinstance(model, PeftModel)
         self.model_adapter_name = model_adapter_name
         self.ref_adapter_name = ref_adapter_name
+        self.reference_free = reference_free
 
         if ref_model:
             self.ref_model = ref_model
@@ -370,7 +378,7 @@ class DPOTrainer(Trainer):
             # tokenize the dataset
             train_dataset = train_dataset.map(self.tokenize_row, num_proc=self.dataset_num_proc)
             if eval_dataset is not None:
-                eval_dataset = eval_dataset.map(self.tokenize_row)
+                eval_dataset = eval_dataset.map(self.tokenize_row, num_proc=self.dataset_num_proc)
 
         super().__init__(
             model=model,
@@ -385,6 +393,10 @@ class DPOTrainer(Trainer):
             optimizers=optimizers,
             preprocess_logits_for_metrics=preprocess_logits_for_metrics,
         )
+
+        # Add tags for models that have been loaded with the correct transformers version
+        if hasattr(self.model, "add_model_tags"):
+            self.model.add_model_tags(self._tag_names)
 
         if not hasattr(self, "accelerator"):
             raise AttributeError(
@@ -723,10 +735,10 @@ class DPOTrainer(Trainer):
 
             if model is not None and hasattr(model, "prepare_decoder_input_ids_from_labels"):
                 batch["rejected_decoder_input_ids"] = model.prepare_decoder_input_ids_from_labels(
-                    labels=batch["rejected_labels"]
+                    labels=torch.tensor(batch["rejected_labels"])
                 )
                 batch["chosen_decoder_input_ids"] = model.prepare_decoder_input_ids_from_labels(
-                    labels=batch["chosen_labels"]
+                    labels=torch.tensor(batch["chosen_labels"])
                 )
 
         return batch
@@ -835,7 +847,6 @@ class DPOTrainer(Trainer):
         policy_rejected_logps: torch.FloatTensor,
         reference_chosen_logps: torch.FloatTensor,
         reference_rejected_logps: torch.FloatTensor,
-        reference_free: bool = False,
     ) -> Tuple[torch.FloatTensor, torch.FloatTensor, torch.FloatTensor]:
         """Compute the DPO loss for a batch of policy and reference model log probabilities.
 
@@ -844,7 +855,6 @@ class DPOTrainer(Trainer):
             policy_rejected_logps: Log probabilities of the policy model for the rejected responses. Shape: (batch_size,)
             reference_chosen_logps: Log probabilities of the reference model for the chosen responses. Shape: (batch_size,)
             reference_rejected_logps: Log probabilities of the reference model for the rejected responses. Shape: (batch_size,)
-            reference_free: If True, we ignore the _provided_ reference model and implicitly use a reference model that assigns equal probability to all responses.
 
         Returns:
             A tuple of three tensors: (losses, chosen_rewards, rejected_rewards).
@@ -852,8 +862,8 @@ class DPOTrainer(Trainer):
             The chosen_rewards and rejected_rewards tensors contain the rewards for the chosen and rejected responses, respectively.
         """
         pi_logratios = policy_chosen_logps - policy_rejected_logps
-        if reference_free:
-            ref_logratios = 0
+        if self.reference_free:
+            ref_logratios = torch.tensor([0], dtype=pi_logratios.dtype, device=pi_logratios.device)
         else:
             ref_logratios = reference_chosen_logps - reference_rejected_logps
 
@@ -1070,6 +1080,8 @@ class DPOTrainer(Trainer):
         with compute_loss_context_manager():
             loss, metrics = self.get_batch_loss_metrics(model, inputs, train_eval="train")
 
+        # Make sure to move the loss to the device the original accumulating loss is at back in the `Trainer` class:
+        loss = loss.to(self.args.device)
         # force log the metrics
         self.store_metrics(metrics, train_eval="train")
 
@@ -1080,7 +1092,7 @@ class DPOTrainer(Trainer):
     def get_batch_samples(self, model, batch: Dict[str, torch.LongTensor]) -> Tuple[str, str]:
         """Generate samples from the model and reference model for the given batch of inputs."""
 
-        # If one uses `generate_during_eval` with peft + bf16, we need to explictly call generate with
+        # If one uses `generate_during_eval` with peft + bf16, we need to explicitly call generate with
         # the torch cuda amp context manager as some hidden states are silently casted to full precision.
         generate_context_manager = nullcontext if not self._peft_has_been_casted_to_bf16 else torch.cuda.amp.autocast
 
@@ -1236,7 +1248,7 @@ class DPOTrainer(Trainer):
     @wraps(Trainer.push_to_hub)
     def push_to_hub(self, commit_message: Optional[str] = "End of training", blocking: bool = True, **kwargs) -> str:
         """
-        Overwrite the `push_to_hub` method in order to force-add the tag "sft" when pushing the
+        Overwrite the `push_to_hub` method in order to force-add the tag "dpo" when pushing the
         model on the Hub. Please refer to `~transformers.Trainer.push_to_hub` for more details.
         """
         kwargs = trl_sanitze_kwargs_for_tagging(model=self.model, tag_names=self._tag_names, kwargs=kwargs)
